@@ -1,0 +1,1190 @@
+---
+title: "통일부 과제"
+author: "Daehyeon Kang, Sogang University"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+header_includes:
+- \usepackage{amsmath}
+- \usepackage{amssymb}
+- \usepackage{amsthm}
+---
+
+```{r}
+library(peacesciencer);library(stargazer)
+library(vdemdata)
+library(WDI);library(ggplot2)
+library(dplyr);library(lmtest)
+library(countrycode)
+```
+
+# Data Preprocessing
+
+## Local Data loading
+
+```{r}
+setwd("") #Set your working directory
+sipri <- readxl::read_xlsx("sipri arms transfer.xlsx")
+gwf <- read.csv("GWF.csv")
+nam <- readxl::read_xlsx("nam memebership.xlsx")
+gsdb <- read.csv("GSDB_V4.csv")
+```
+
+## WDI
+
+```{r}
+pacman::p_load(tidyverse, wbstats, countrycode)
+
+indicators <- c(
+  "oda_total"      = "DT.ODA.ALLD.CD",    # Net ODA received
+  "totlaNR" = "NY.GDP.TOTL.RT.ZS"
+)
+raw_wdi <- wb_data(
+  indicator = indicators, 
+  start_date = 1960, 
+  end_date = 2023,
+  return_wide = TRUE
+)
+
+panel_data <- raw_wdi %>%
+  dplyr::select(iso3c, country, date, everything()) %>%
+  rename(year = date) %>%
+  mutate(
+    cowcode = countrycode(iso3c, origin = "iso3c", destination = "cown"),
+    cowcode = as.numeric(cowcode)
+  ) %>%
+  filter(!is.na(iso3c)) %>% 
+  select(country, iso3c, cowcode, year, everything()) %>%
+  arrange(country, year)
+
+head(panel_data)
+summary(panel_data)
+```
+
+## Vdem
+
+```{r}
+df1 <- vdem %>% 
+  dplyr::select(
+    country_name,                 
+    year,                         
+    COWcode,                       
+    v2x_libdem,e_regiongeo,
+    v2x_regime,
+    v2svinlaut,
+    v2svindep,
+    v2exl_legitideolcr_1
+  ) %>%
+  rename(
+    cow_code = COWcode,
+    democracy_index = v2x_libdem,
+    region = e_regiongeo,
+    regime =v2x_regime,
+    intlaut = v2svinlaut,
+    indp = v2svindep,
+    ideology = v2exl_legitideolcr_1
+  ) 
+```
+
+Regarding region,
+1: Western Europe 2: Northern Europe 3: Southern Europe 4: Eastern Europe 
+5: Northern Africa 6: Western Africa 7: Middle Africa 8: Eastern Africa 9: Southern Africa 
+
+10: Western Asia 11: Central Asia 12: Eastern Asia 13: South-Eastern Asia 14: Southern Asia 15: Oceania (including Australia and the Pacific) 16: North America 17: Central America 18: South America 19: Caribbean (including Cuba, Haiti, Dominican Republic and Guyana)
+
+
+## Peacesciencer
+
+Model 1
+DV
+add_fpsim()
+IV
+NAM
+CV
+add_sim_gdp_pop(data, keep)
+WDI - DT.ODA.ALLD.CD
+GWF
+
+```{r}
+ps_data <- create_stateyears(system = "cow") %>%        
+  add_nmc() %>%                  
+  add_sim_gdp_pop()
+
+final_ps_data <- ps_data %>%
+  left_join(peacesciencer::cow_igo_sy, by = c("ccode", "year"))
+```
+
+```{r}
+dyad_mids <- create_dyadyears(system = "cow") %>%
+  add_gml_mids()
+
+state_mids <- dyad_mids %>%
+  group_by(ccode1, year) %>%
+  summarise(
+    mid_ongoing_count = sum(gmlmidongoing, na.rm = TRUE),
+    mid_onset_count = sum(gmlmidonset, na.rm = TRUE),
+    # GML MID 데이터의 적대 수준 변수명은 'hostlev'입니다.
+    max_hostlev = max(hostlev, na.rm = TRUE),
+    has_mid_ongoing = ifelse(mid_ongoing_count > 0, 1, 0),
+    has_mid_onset = ifelse(mid_onset_count > 0, 1, 0),
+    .groups = "drop"
+  ) %>%
+  mutate(max_hostlev = ifelse(is.infinite(max_hostlev), 1, max_hostlev)) %>%
+  rename(cow_code = ccode1)
+```
+
+```{r}
+final_merged_data <- final_ps_data %>%
+  left_join(
+    state_mids, 
+    by = c("ccode" = "cow_code", "year" = "year")
+  ) %>%
+  replace_na(list(
+    mid_ongoing_count = 0,
+    mid_onset_count = 0,
+    max_hostlev = 1,
+    has_mid_ongoing = 0,
+    has_mid_onset = 0
+  ))
+```
+
+```{r}
+fpsim <- create_dyadyears(system = "cow") %>% 
+  add_fpsim() %>% 
+  dplyr::select(ccode1,ccode2,year,kappavv,pivv)
+
+monadic_fpsim <- bind_rows(
+  fpsim %>% rename(ccode = ccode1, target_ccode = ccode2),
+  fpsim %>% rename(ccode = ccode2, target_ccode = ccode1)
+)
+
+country_year_panel <- monadic_fpsim %>%
+  # 비교 대상국이 미국, 중국, 북한인 경우만 선택
+  filter(target_ccode %in% c(2, 710, 731)) %>%
+  # 새로 만들 컬럼 이름의 접미사(Suffix) 정의
+  mutate(target_label = case_when(
+    target_ccode == 2   ~ "usa",
+    target_ccode == 710 ~ "chn",
+    target_ccode == 731 ~ "prk"
+  )) %>%
+  distinct(ccode, year, target_label, .keep_all = TRUE) %>%
+  pivot_wider(
+    id_cols = c(ccode, year),
+    names_from = target_label,
+    values_from = c(kappavv, pivv),
+    names_glue = "{.value}_{target_label}"
+  )
+
+```
+
+```{r}
+ultimate_panel_data <- final_merged_data %>%
+  left_join(country_year_panel, by = c("ccode", "year"))
+```
+
+
+```{r}
+atop_summary <- atop_alliance %>%
+  group_by(ccode1, year) %>%
+  summarise(
+    num_defense_allies = sum(atop_defense, na.rm = TRUE),
+    num_any_allies = sum(ifelse(atop_defense == 1 | atop_offense == 1 | 
+                                atop_neutral == 1 | atop_nonagg == 1 | 
+                                atop_consul == 1, 1, 0), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(ccode = ccode1)
+
+final_panel_v2 <- ultimate_panel_data %>%
+  left_join(atop_summary, by = c("ccode", "year")) %>%
+  mutate(
+    num_defense_allies = replace_na(num_defense_allies, 0),
+    num_any_allies = replace_na(num_any_allies, 0)
+  )
+```
+
+## Vdem X Peace
+
+```{r}
+master_dataset <- final_panel_v2 %>%
+    left_join(
+    df1 %>% 
+      rename(ccode = cow_code, country_name_regime = country_name), 
+    by = c("ccode", "year")
+  ) %>%
+  dplyr::select(
+    everything()
+  )
+```
+
+## Data merging
+
+```{r}
+finaldf <- master_dataset %>%
+  left_join(
+    panel_data %>% dplyr::select(cowcode, year, iso3c, oda_total, totlaNR),
+    by = c("ccode" = "cowcode", "year" = "year")
+  )
+```
+
+```{r}
+finaldf_gwf <- finaldf %>%
+  left_join(
+    gwf %>% dplyr::select(cowcode, year, gwf_regimetype, gwf_duration, gwf_fail),
+    by = c("ccode" = "cowcode", "year" = "year")
+  )
+
+gsdb_panel <- gsdb %>%
+  mutate(end = replace_na(end, 2022)) %>%
+  mutate(sanctioned_state = case_when(
+    sanctioned_state == "Korea, North" ~ "North Korea",
+    sanctioned_state == "Korea, South" ~ "South Korea",
+    sanctioned_state == "Gambia, The" ~ "Gambia",
+    grepl("Egypt", sanctioned_state) ~ "Egypt",
+    grepl("Democratic Republic of the", sanctioned_state) ~ "Democratic Republic of the Congo", 
+    TRUE ~ sanctioned_state
+  )) %>%
+  separate_longer_delim(sanctioned_state, delim = ", ") %>%
+  mutate(sanctioned_state = str_trim(sanctioned_state)) %>%
+  mutate(sanctioned_state = case_when(
+    sanctioned_state == "Ceylon" ~ "Sri Lanka",
+    sanctioned_state == "South Vietnam" ~ "Republic of Vietnam",
+    sanctioned_state == "Malaya" ~ "Malaysia",
+    sanctioned_state == "Ethiopia (excludes Eritrea)" ~ "Ethiopia",
+    sanctioned_state == "Serbia" ~ "Republic of Serbia",
+    sanctioned_state == "Palestine" ~ "Palestine", 
+    TRUE ~ sanctioned_state
+  )) %>%
+  rowwise() %>%
+  mutate(year = list(seq(begin, end))) %>%
+  unnest(year) %>%
+  ungroup() %>%
+  mutate(ccode = countrycode(sanctioned_state, origin = "country.name", destination = "cown")) %>%
+  filter(!is.na(ccode)) %>% 
+  group_by(ccode, year) %>%
+  summarise(
+    is_sanctioned = 1,              
+    total_sanc_cases = n(),         
+    sanc_trade = max(trade, na.rm = TRUE),       
+    sanc_arms = max(arms, na.rm = TRUE),          
+    sanc_military = max(military, na.rm = TRUE), 
+    sanc_financial = max(financial, na.rm = TRUE),
+    sanc_travel = max(travel, na.rm = TRUE),    
+    .groups = "drop"
+  )
+
+ultimate_df <- finaldf_gwf %>%
+  left_join(gsdb_panel, by = c("ccode", "year")) %>%
+  replace_na(list(
+    is_sanctioned = 0,
+    total_sanc_cases = 0,
+    sanc_trade = 0,
+    sanc_arms = 0,
+    sanc_military = 0,
+    sanc_financial = 0,
+    sanc_travel = 0
+  ))
+```
+
+```{r}
+nam_panel <- nam %>%
+  filter(Category == "Country") %>%
+  mutate(
+    `Join Year` = as.numeric(`Join Year`),
+    `Leave Year` = as.numeric(`Leave Year`),
+    `Leave Year` = replace_na(`Leave Year`, 2024)
+  ) %>%
+  filter(!is.na(`Join Year`)) %>% 
+  
+  mutate(ccode = countrycode(`Country/Organization`, origin = "country.name", destination = "cown")) %>%
+  filter(!is.na(ccode)) %>% 
+  rowwise() %>%
+  mutate(year = list(seq(`Join Year`, `Leave Year`))) %>%
+  unnest(year) %>%
+  ungroup() %>%
+  mutate(
+    is_nam_member = ifelse(Status %in% c("Member", "Former Member"), 1, 0),
+    is_nam_observer = ifelse(Status %in% c("Observer", "Former Observer"), 1, 0)
+  ) %>%
+  group_by(ccode, year) %>%
+  summarise(
+    is_nam_member = max(is_nam_member, na.rm = TRUE),
+    is_nam_observer = max(is_nam_observer, na.rm = TRUE),
+    .groups = "drop"
+  )
+ultimate_df_final <- ultimate_df %>%
+  left_join(nam_panel, by = c("ccode", "year")) %>%
+  replace_na(list(
+    is_nam_member = 0,
+    is_nam_observer = 0
+  ))
+```
+
+```{r}
+ultimate_df_final <- ultimate_df_final %>%
+  mutate(
+    global_south = ifelse(region %in% c(5:15, 17:19), 1, 0), # 5~15(아프리카, 아시아, 오세아니아), 17~19(중남미, 카리브해)를 1(Global South)로 코딩
+    global_south = case_when( #예외 국가들
+      ccode == 740 ~ 0, # 일본
+      ccode == 732 ~ 0, # 한국
+      ccode == 713 ~ 0, # 대만
+      ccode == 900 ~ 0, # 호주
+      ccode == 920 ~ 0, # 뉴질랜드
+      ccode == 666 ~ 0, # 이스라엘
+      TRUE ~ global_south 
+    )
+  )
+
+# 결과 확인 (생성된 더미 변수 빈도수 체크)
+table(ultimate_df_final$global_south, useNA = "ifany")
+```
+
+```{r}
+ultimate_df_final<-ultimate_df_final %>% 
+  filter(year>1959) %>% mutate(
+    socialist_nar = ifelse(gwf_regimetype=="party-based",1,0),
+    socialist_wide =ifelse(gwf_regimetype %in% c("party-based","party-personal"),1,0),
+    ColdWar = ifelse(year > 1991, 0, 1),
+    log_mrgdppc = log1p(mrgdppc),
+    log_oda = log1p(pmax(oda_total,0)),
+    log_nr = log1p(totlaNR)
+  )
+globalsouth <- ultimate_df_final %>% filter(
+  global_south == 1
+)
+
+africa <- ultimate_df_final %>% 
+  filter(region %in% c(5, 6, 7, 8, 9)) %>% 
+  mutate(
+    sub_region = factor(region, 
+                        levels = c(5, 6, 7, 8, 9), 
+                        labels = c("North", "West", "Central", "East", "Southern"))
+  )
+  
+```
+
+
+# Data analysis
+
+# 제 2장
+
+```{r}
+library(plm)
+```
+
+# 가설 1
+DV: UNGA 총회 일치도 - kappa(Cohen's Kappa), 북한에서 해당 국가의 값을 뻄.
+IV: NAM여부, 사회주의 여부 (ideology - 사회주의 강조 수준, socialist_nar - party-based, socialist_wide - party based or party-personal)
+
+## 전세계 국가 기준
+
+```{r}
+hyp1_model1 <- plm(
+  kappavv_prk ~
+    is_nam_member + ideology +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = ultimate_df_final,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+hyp1_model2 <- plm(
+  kappavv_prk ~
+    is_nam_member +socialist_nar +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = ultimate_df_final,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+hyp1_model3 <- plm(
+  kappavv_prk ~
+    is_nam_member +socialist_wide +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = ultimate_df_final,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+```
+
+```{r}
+# Arellano Robust SE 
+ct1_fe <- coeftest(hyp1_model1, vcov. = vcovHC(hyp1_model1, method = "arellano", type = "HC1", cluster = "group"))
+ct2_fe <- coeftest(hyp1_model2, vcov. = vcovHC(hyp1_model2, method = "arellano", type = "HC1", cluster = "group"))
+ct3_fe <- coeftest(hyp1_model3, vcov. = vcovHC(hyp1_model3, method = "arellano", type = "HC1", cluster = "group"))
+
+stargazer(
+  ct1_fe, ct2_fe, ct3_fe,
+  type = "text",
+  
+  column.labels = c("Model 1", "Model 2", "Model 3"),
+  dep.var.labels = "UNGA Voting Alignment with North Korea (Kappa)",
+  
+  covariate.labels = c(
+    "NAM Membership",
+    "Ideology",
+    "Socialist State (Narrow)", 
+    "Socialist State (Broad)",
+    "IGO Membership",
+    "Conflict Intensity",
+    "GDP per Capita (log)",
+    "ODA (log)",
+    "Natural Resources (log)"
+  ),
+  
+  order = c(
+    "^is_nam_member$", "^ideology$", "^socialist_nar$", "^socialist_wide$", 
+    "^sum_igo_full$", "^max_hostlev$", "^log_mrgdppc$", "^log_oda$", "^log_nr$"
+  ),
+  
+  add.lines = list(
+    c("Estimation Method", "Fixed Effects", "Fixed Effects", "Fixed Effects"),
+    c("Country FE", "Yes", "Yes", "Yes"),
+    c("Year FE", "Yes", "Yes", "Yes"),
+    
+    c("Observations", 
+      length(hyp1_model1$residuals), 
+      length(hyp1_model2$residuals), 
+      length(hyp1_model3$residuals)),
+    c("R-squared", 
+      round(as.numeric(summary(hyp1_model1)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model2)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model3)$r.squared[1]), 3)),
+    
+    c("Robust SE", "Arellano HC1", "Arellano HC1", "Arellano HC1")
+  ),
+  
+  omit.stat = c("f", "rsq", "adj.rsq", "n"), 
+  digits = 3,
+  star.cutoffs = c(0.1, 0.05, 0.01),
+  notes = "Arellano HC1 standard errors clustered by country are reported in parentheses."
+)
+```
+
+## 아프리카 국가 기준
+
+```{r}
+hyp1_model1_fe <- plm(
+  kappavv_prk ~
+    is_nam_member + ideology +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = africa,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+hyp1_model2_fe <- plm(
+  kappavv_prk ~
+    is_nam_member +socialist_nar +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = africa,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+hyp1_model3_fe <- plm(
+  kappavv_prk ~
+    is_nam_member +socialist_wide +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = africa,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+```
+
+```{r}
+# Arellano Robust SE 
+ct1_fe <- coeftest(hyp1_model1_fe, vcov. = vcovHC(hyp1_model1_fe, method = "arellano", type = "HC1", cluster = "group"))
+ct2_fe <- coeftest(hyp1_model2_fe, vcov. = vcovHC(hyp1_model2_fe, method = "arellano", type = "HC1", cluster = "group"))
+ct3_fe <- coeftest(hyp1_model3_fe, vcov. = vcovHC(hyp1_model3_fe, method = "arellano", type = "HC1", cluster = "group"))
+
+stargazer(
+  ct1_fe, ct2_fe, ct3_fe,
+  type = "text",
+  
+  column.labels = c("Model 1", "Model 2", "Model 3"),
+  dep.var.labels = "African UNGA Voting Alignment with North Korea (Kappa)",
+  
+  covariate.labels = c(
+    "NAM Membership",
+    "Ideology",
+    "Socialist State (Narrow)", 
+    "Socialist State (Broad)",
+    "IGO Membership",
+    "Conflict Intensity",
+    "GDP per Capita (log)",
+    "ODA (log)",
+    "Natural Resources (log)"
+  ),
+  
+  order = c(
+    "^is_nam_member$", "^ideology$", "^socialist_nar$", "^socialist_wide$", 
+    "^sum_igo_full$", "^max_hostlev$", "^log_mrgdppc$", "^log_oda$", "^log_nr$"
+  ),
+  
+  add.lines = list(
+    c("Estimation Method", "Fixed Effects", "Fixed Effects", "Fixed Effects"),
+    c("Country FE", "Yes", "Yes", "Yes"),
+    c("Year FE", "Yes", "Yes", "Yes"),
+    
+    c("Observations", 
+      length(hyp1_model1_fe$residuals), 
+      length(hyp1_model2_fe$residuals), 
+      length(hyp1_model3_fe$residuals)),
+    c("R-squared", 
+      round(as.numeric(summary(hyp1_model1_fe)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model2_fe)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model3_fe)$r.squared[1]), 3)),
+    
+    c("Robust SE", "Arellano HC1", "Arellano HC1", "Arellano HC1")
+  ),
+  
+  omit.stat = c("f", "rsq", "adj.rsq", "n"), 
+  digits = 3,
+  star.cutoffs = c(0.1, 0.05, 0.01),
+  notes = "Arellano HC1 standard errors clustered by country are reported in parentheses."
+)
+```
+
+```{r}
+extract <- ultimate_df_final %>% dplyr::select(ccode,year,kappavv_prk,is_nam_member,ideology,socialist_nar,socialist_wide,region,global_south,
+                                               sum_igo_full,max_hostlev,mrgdppc,oda_total,totlaNR,ColdWar,log_mrgdppc,log_oda,log_nr)
+write.csv(extract,"제2장 가설 1 검정 데이터(full data).csv")
+```
+
+
+# 가설 2
+
+Hausman-Taylor 모델 사용.
+
+```{r}
+#Mundlak용
+africa_mundlak <- africa %>%
+  group_by(ccode) %>%
+  mutate(
+    mean_igo = mean(sum_igo_full, na.rm = TRUE),
+    median_host = median(max_hostlev, na.rm = TRUE),
+    mean_gdp = mean(log_mrgdppc, na.rm = TRUE),
+    mean_oda = mean(log_oda, na.rm = TRUE),
+    mean_nr = mean(log_nr, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+extract <- africa_mundlak %>% dplyr::select(ccode,year,kappavv_prk,is_nam_member,ideology,socialist_nar,socialist_wide,region,global_south,sub_region,
+                                               sum_igo_full,max_hostlev,mrgdppc,oda_total,totlaNR,ColdWar,log_mrgdppc,log_oda,log_nr)
+write.csv(extract,"제2장 가설 2 검정 데이터(full data).csv")
+```
+
+
+```{r}
+hyp2_model_pooled <- plm(
+  kappavv_prk ~ sub_region + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = africa_mundlak, # 통일성을 위해 모두 africa_mundlak 사용
+  index = c("ccode", "year"),
+  model = "pooling"
+)
+
+hyp2_model_re <- plm(
+  kappavv_prk ~ sub_region + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = africa_mundlak,
+  index = c("ccode", "year"),
+  model = "random",
+  effect = "twoways"
+)
+
+hyp2_model_mundlak <- plm(
+  kappavv_prk ~ sub_region + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr +
+                mean_igo + median_host + mean_gdp + mean_oda + mean_nr,
+  data = africa_mundlak,
+  index = c("ccode", "year"),
+  model = "random",  
+  effect = "individual"
+)
+
+hyp2_model_between <- plm(
+  kappavv_prk ~ sub_region + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = africa_mundlak,
+  index = c("ccode", "year"),
+  model = "between" 
+)
+```
+
+```{r}
+ct_between <- coeftest(hyp2_model_between, vcov. = vcov(hyp2_model_between))
+ct_pooled <- coeftest(hyp2_model_pooled, vcov. = vcovHC(hyp2_model_pooled, type = "HC1", cluster = "group"))
+ct_re <- coeftest(hyp2_model_re, vcov. = vcovHC(hyp2_model_re, type = "HC1", cluster = "group"))
+ct_mundlak <- coeftest(hyp2_model_mundlak, vcov. = vcovHC(hyp2_model_mundlak, type = "HC1", cluster = "group"))
+
+stargazer(
+  ct_pooled, ct_re, ct_mundlak, ct_between,
+  type = "text",
+  
+  # 컬럼 이름 설정
+  column.labels = c("Pooled OLS", "Random Effects", "Mundlak (CRE)", "Between"),
+  dep.var.labels = "UNGA Voting Alignment with North Korea (Africa Only)",
+  covariate.labels = c(
+    "Sub-region: West",
+    "Sub-region: Central",
+    "Sub-region: East",
+    "Sub-region: Southern",
+    "IGO Membership",
+    "Conflict Intensity",
+    "GDP per Capita (log)",
+    "ODA (log)",
+    "Natural Resources (log)"
+  ),
+  order = c(
+    "West", "Central", "East", "Southern", 
+    "^sum_igo_full$", "^max_hostlev$", "^log_mrgdppc$", "^log_oda$", "^log_nr$"
+  ),
+  omit = c("^mean_", "^median_", "factor\\(year\\)"),
+  
+  add.lines = list(
+    c("Reference Region", "North", "North", "North", "North"),
+    c("Mundlak Controls", "No", "No", "Yes", "No"),
+    c("Observations", 
+      length(hyp2_model_pooled$residuals), 
+      length(hyp2_model_re$residuals), 
+      length(hyp2_model_mundlak$residuals), 
+      length(hyp2_model_between$residuals)),
+      
+    c("R-squared", 
+      round(as.numeric(summary(hyp2_model_pooled)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp2_model_re)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp2_model_mundlak)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp2_model_between)$r.squared[1]), 3))
+  ),
+  
+  omit.stat = c("f", "rsq", "adj.rsq", "n"), 
+  digits = 3,
+  star.cutoffs = c(0.1, 0.05, 0.01),
+  notes = "Robust SEs (clustered by country) are reported in parentheses."
+)
+```
+
+# 기술 통계 그래프 두개만
+
+## 지역별 독립연도 추세
+
+```{r}
+ggplot(ultimate_df_final %>% filter(!is.na(indp) & indp > 1800), aes(x = factor(region), y = indp)) +
+  geom_boxplot(aes(fill = factor(region))) +
+  theme_minimal() +
+  labs(title = "Region별 국가 독립 연도 분포",
+       x = "Region Code", y = "Year of Independence") +
+  theme(legend.position = "none")
+```
+
+
+## 지역별 NAM가입 추세
+
+```{r}
+# 연도별, 지역별 NAM 가입 비율 계산
+nam_trend <- ultimate_df_final %>%
+  filter(!is.na(region)) %>%
+  group_by(year, region) %>%
+  summarise(nam_rate = mean(is_nam_member, na.rm = TRUE), .groups = 'drop')
+
+# 시계열 추세 시각화
+ggplot(nam_trend, aes(x = year, y = nam_rate, color = factor(region))) +
+  geom_line(size = 1) +
+  theme_minimal() +
+  labs(title = "Region별 연도별 NAM 가입 국가 비율 추세",
+       x = "Year", y = "Proportion of NAM Members",
+       color = "Region Code")
+```
+
+# 제 3장 
+
+## 3-1
+
+### 가설 1
+
+### 가설 2
+
+```{r}
+hyp1_model_pooled <- plm(
+  kappavv_prk ~ ColdWar 
+  + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = africa_mundlak, # 통일성을 위해 모두 africa_mundlak 사용
+  index = c("ccode", "year"),
+  model = "pooling"
+)
+hyp1_model_re <- plm(
+  kappavv_prk ~ ColdWar 
+  + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = africa_mundlak,
+  index = c("ccode", "year"),
+  model = "random",
+  effect = "twoways"
+)
+hyp1_model_mundlak <- plm(
+  kappavv_prk ~ ColdWar 
+  + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr +
+                mean_igo + median_host + mean_gdp + mean_oda + mean_nr,
+  data = africa_mundlak,
+  index = c("ccode", "year"),
+  model = "random",  
+  effect = "individual"
+)
+hyp1_model_between <- plm(
+  kappavv_prk ~ ColdWar 
+  + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = africa_mundlak,
+  index = c("ccode", "year"),
+  model = "between" 
+)
+```
+
+```{r}
+ct_between <- coeftest(hyp1_model_between, vcov. = vcov(hyp1_model_between))
+ct_pooled <- coeftest(hyp1_model_pooled, vcov. = vcovHC(hyp1_model_pooled, type = "HC1", cluster = "group"))
+ct_re <- coeftest(hyp1_model_re, vcov. = vcovHC(hyp1_model_re, type = "HC1", cluster = "group"))
+ct_mundlak <- coeftest(hyp1_model_mundlak, vcov. = vcovHC(hyp1_model_mundlak, type = "HC1", cluster = "group"))
+
+stargazer(
+  ct_pooled, ct_re, ct_mundlak, ct_between,
+  type = "text",
+  
+  column.labels = c("Pooled OLS", "Random Effects", "Mundlak (CRE)", "Between"),
+  dep.var.labels = "UNGA Voting Alignment with North Korea (Africa Only)",
+  covariate.labels = c(
+    "Post-Cold War",         
+    "IGO Membership",
+    "Conflict Intensity",
+    "GDP per Capita (log)",
+    "ODA (log)",
+    "Natural Resources (log)"
+  ),
+  order = c(
+    "PostColdWar",
+    "^sum_igo_full$", "^max_hostlev$", "^log_mrgdppc$", "^log_oda$", "^log_nr$"
+  ),
+  omit = c("^mean_", "^median_", "factor\\(year\\)"),
+  add.lines = list(
+    c("Mundlak Controls", "No", "No", "Yes", "No"),
+    c("Observations", 
+      length(hyp1_model_pooled$residuals), 
+      length(hyp1_model_re$residuals), 
+      length(hyp1_model_mundlak$residuals), 
+      length(hyp1_model_between$residuals)),
+    c("R-squared", 
+      round(as.numeric(summary(hyp1_model_pooled)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model_re)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model_mundlak)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model_between)$r.squared[1]), 3))
+  ),
+  omit.stat = c("f", "rsq", "adj.rsq", "n"), 
+  digits = 3,
+  star.cutoffs = c(0.1, 0.05, 0.01),
+  notes = "Robust SEs (clustered by country) are reported in parentheses."
+)
+```
+
+## 3-3
+
+```{r}
+afterCW <- ultimate_df_final %>% filter(
+ ColdWar == 0)%>%
+  mutate(
+    is_authoritarian = ifelse(regime %in% 0:1, "AUtocracy", "Democracy"), 
+    regime_factor = factor(regime, levels = 0:3, 
+                           labels = c("Closed", "Electoral_Auto", "Electoral_Demo", "Liberal_Demo"))
+  )
+afterCW$regime_factor <- relevel(afterCW$regime_factor, ref = "Liberal_Demo")
+```
+
+### 가설 1
+
+```{r}
+extract <- afterCW %>% dplyr::select(ccode,year,kappavv_prk,is_nam_member,ideology,socialist_nar,socialist_wide,region,global_south,is_authoritarian,
+                                               sum_igo_full,max_hostlev,mrgdppc,oda_total,totlaNR,ColdWar,log_mrgdppc,log_oda,log_nr)
+write.csv(extract,"제3-3장 가설 1,2,3 검정 데이터(full data).csv")
+```
+
+
+```{r}
+hyp1_model <- plm(
+  kappavv_prk ~
+    is_nam_member +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = afterCW,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+```
+
+### 가설 2
+
+```{r}
+hyp2_model_1 <- plm(
+  kappavv_prk ~
+    socialist_nar +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = afterCW,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+hyp2_model_2 <- plm(
+  kappavv_prk ~
+    socialist_wide +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = afterCW,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+```
+
+### 가설 3
+
+```{r}
+hyp3_model_1<- plm(
+  kappavv_prk ~
+    is_authoritarian +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = afterCW,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+```
+```{r}
+hyp3_model_2<- plm(
+  kappavv_prk ~
+    regime_factor +
+    sum_igo_full +max_hostlev +
+    log1p(mrgdppc) +log1p(oda_total) +log1p(totlaNR),
+  data = afterCW,
+  index = c("ccode", "year"),
+  model = "within",
+  effect = "twoways"
+)
+```
+### Stargazer
+
+```{r}
+# 1. 모든 모델에 Robust SE (Clustered by country) 적용
+ct1 <- coeftest(hyp1_model, vcov. = vcovHC(hyp1_model, method = "arellano", type = "HC1", cluster = "group"))
+ct2_1 <- coeftest(hyp2_model_1, vcov. = vcovHC(hyp2_model_1, method = "arellano", type = "HC1", cluster = "group"))
+ct2_2 <- coeftest(hyp2_model_2, vcov. = vcovHC(hyp2_model_2, method = "arellano", type = "HC1", cluster = "group"))
+ct3_1 <- coeftest(hyp3_model_1, vcov. = vcovHC(hyp3_model_1, method = "arellano", type = "HC1", cluster = "group"))
+ct3_2 <- coeftest(hyp3_model_2, vcov. = vcovHC(hyp3_model_2, method = "arellano", type = "HC1", cluster = "group"))
+
+# 2. Stargazer 통합 테이블 출력
+stargazer(
+  ct1, ct2_1, ct2_2, ct3_1, ct3_2,
+  type = "text",
+  column.labels = c("H1", "H2-Nar", "H2-Wide", "H3-Bin", "H3-Scale"),
+  dep.var.labels = "UNGA Alignment (Kappa)",
+  
+  # 가독성을 위한 변수 라벨링
+  covariate.labels = c(
+    "NAM Membership",
+    "Socialist (Narrow)",
+    "Socialist (Broad)",
+    "Authoritarian (Binary)",
+    "Regime: Electoral Auto.",
+    "Regime: Electoral Demo.",
+    "Regime: Liberal Demo.",
+    "IGO Membership",
+    "Conflict Intensity",
+    "GDP per Capita (log)",
+    "ODA (log)",
+    "Natural Resources (log)"
+  ),
+  
+  # 출력 순서 제어
+  order = c(
+    "is_nam_member", "socialist_nar", "socialist_wide", "is_authoritarian", "regime_factor",
+    "sum_igo_full", "max_hostlev", "log1p(mrgdppc)", "log1p(oda_total)", "log1p(totlaNR)"
+  ),
+  
+  add.lines = list(
+    c("Country FE", "Yes", "Yes", "Yes", "Yes", "Yes"),
+    c("Year FE", "Yes", "Yes", "Yes", "Yes", "Yes"),
+    c("Observations", length(hyp1_model$residuals), length(hyp2_model_1$residuals), 
+      length(hyp2_model_2$residuals), length(hyp3_model_1$residuals), length(hyp3_model_2$residuals))
+  ),
+  
+  omit.stat = c("f", "rsq", "adj.rsq", "n"),
+  digits = 3,
+  star.cutoffs = c(0.1, 0.05, 0.01),
+  notes = "Robust SEs (clustered by country) are reported in parentheses."
+)
+```
+
+
+## 3-5
+
+### 가설 1
+
+```{r}
+#Mundlak용
+final_mundlak <- ultimate_df_final %>%
+  group_by(ccode) %>%
+  mutate(
+    mean_igo = mean(sum_igo_full, na.rm = TRUE),
+    median_host = median(max_hostlev, na.rm = TRUE),
+    mean_gdp = mean(log_mrgdppc, na.rm = TRUE),
+    mean_oda = mean(log_oda, na.rm = TRUE),
+    mean_nr = mean(log_nr, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+extract <- afterCW %>% dplyr::select(ccode,year,kappavv_prk,global_south,
+                                     sum_igo_full,max_hostlev,mrgdppc,oda_total,totlaNR,ColdWar,log_mrgdppc,log_oda,log_nr)
+write.csv(extract,"제3-5장 가설 1 검정 데이터.csv")
+```
+
+
+
+```{r}
+hyp1_model_pooled <- plm(
+  kappavv_prk ~ global_south 
+  + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = final_mundlak, # 통일성을 위해 모두 final_mundlak 사용
+  index = c("ccode", "year"),
+  model = "pooling"
+)
+
+hyp1_model_re <- plm(
+  kappavv_prk ~ global_south 
+  + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = final_mundlak,
+  index = c("ccode", "year"),
+  model = "random",
+  effect = "twoways"
+)
+
+hyp1_model_mundlak <- plm(
+  kappavv_prk ~ global_south 
+  + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr +
+                mean_igo + median_host + mean_gdp + mean_oda + mean_nr,
+  data = final_mundlak,
+  index = c("ccode", "year"),
+  model = "random",  
+  effect = "individual"
+)
+
+hyp1_model_between <- plm(
+  kappavv_prk ~ global_south 
+  + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = final_mundlak,
+  index = c("ccode", "year"),
+  model = "between" 
+)
+```
+
+```{r}
+ct_pooled <- coeftest(hyp1_model_pooled, vcov. = vcovHC(hyp1_model_pooled, type = "HC1", cluster = "group"))
+ct_re <- coeftest(hyp1_model_re, vcov. = vcovHC(hyp1_model_re, type = "HC1", cluster = "group"))
+ct_mundlak <- coeftest(hyp1_model_mundlak, vcov. = vcovHC(hyp1_model_mundlak, type = "HC1", cluster = "group"))
+ct_between <- coeftest(hyp1_model_between, vcov. = vcov(hyp1_model_between))
+# 2. Stargazer 테이블 출력 수정
+stargazer(
+  ct_pooled, ct_re, ct_mundlak, ct_between,
+  type = "text",
+  
+  column.labels = c("Pooled OLS", "Random Effects", "Mundlak (CRE)", "Between"),
+  dep.var.labels = "UNGA Voting Alignment with North Korea",
+  
+  # 가설 변수 'Global South' 추가 및 라벨 정렬
+  covariate.labels = c(
+    "Global South",
+    "IGO Membership",
+    "Conflict Intensity",
+    "GDP per Capita (log)",
+    "ODA (log)",
+    "Natural Resources (log)"
+  ),
+  
+  # 변수 순서 정렬 (global_south를 맨 위로)
+  order = c(
+    "global_south", 
+    "^sum_igo_full$", "^max_hostlev$", "^log_mrgdppc$", "^log_oda$", "^log_nr$"
+  ),
+  
+  # 먼들락 평균 변수 숨기기
+  omit = c("^mean_", "^median_", "factor\\(year\\)"),
+  
+  add.lines = list(
+    c("Mundlak Controls", "No", "No", "Yes", "No"),
+    c("Observations", 
+      length(hyp1_model_pooled$residuals), 
+      length(hyp1_model_re$residuals), 
+      length(hyp1_model_mundlak$residuals), 
+      length(hyp1_model_between$residuals)),
+    c("R-squared", 
+      round(as.numeric(summary(hyp1_model_pooled)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model_re)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model_mundlak)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp1_model_between)$r.squared[1]), 3))
+  ),
+  
+  omit.stat = c("f", "rsq", "adj.rsq", "n"), 
+  digits = 3,
+  star.cutoffs = c(0.1, 0.05, 0.01),
+  notes = "Robust SEs (clustered by country) are reported in parentheses."
+)
+```
+
+
+### 가설 2
+
+```{r}
+final_mundlak_refined <- final_mundlak %>%
+  mutate(
+    sub_global = case_when(
+      region %in% 5:9   ~ "Africa",          # 아프리카
+      region == 10      ~ "Middle East",     # 중동 (Western Asia)
+      region %in% 17:19 ~ "Latin America",   # 중남미
+      region == 13      ~ "Southeast Asia",  # 동남아
+      region %in% 11:12 | region == 14 ~ "Asia", # 그 외 아시아
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(sub_global != "Other") %>% 
+  mutate(sub_global = factor(sub_global, 
+                             levels = c("Africa", "Middle East", "Latin America", "Southeast Asia", "Asia")))
+```
+
+```{r}
+extract <- final_mundlak_refined %>% dplyr::select(ccode,year,kappavv_prk,sub_global,
+                                     sum_igo_full,max_hostlev,mrgdppc,oda_total,totlaNR,ColdWar,log_mrgdppc,log_oda,log_nr)
+write.csv(extract,"제3-5장 가설 2 검정 데이터.csv")
+```
+
+
+```{r}
+hyp2_model_pooled <- plm(
+  kappavv_prk ~ sub_global + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = final_mundlak_refined, # 통일성을 위해 모두 final_mundlak_refined 사용
+  index = c("ccode", "year"),
+  model = "pooling"
+)
+
+hyp2_model_re <- plm(
+  kappavv_prk ~ sub_global + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = final_mundlak_refined,
+  index = c("ccode", "year"),
+  model = "random",
+  effect = "twoways"
+)
+
+hyp2_model_mundlak <- plm(
+  kappavv_prk ~ sub_global + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr +
+                mean_igo + median_host + mean_gdp + mean_oda + mean_nr,
+  data = final_mundlak_refined,
+  index = c("ccode", "year"),
+  model = "random",  
+  effect = "individual"
+)
+
+hyp2_model_between <- plm(
+  kappavv_prk ~ sub_global + sum_igo_full + max_hostlev + log_mrgdppc + log_oda + log_nr,
+  data = final_mundlak_refined,
+  index = c("ccode", "year"),
+  model = "between" 
+)
+```
+
+```{r}
+stargazer(
+  ct_pooled, ct_re, ct_mundlak, ct_between,
+  type = "text",
+  column.labels = c("Pooled OLS", "Random Effects", "Mundlak (CRE)", "Between"),
+  dep.var.labels = "UNGA Voting Alignment with North Korea (Global South)",
+  
+  # 지역 범주에 따른 라벨링 (Africa가 기준이므로 나머지 4개 지역 라벨링)
+  covariate.labels = c(
+    "Region: Middle East",
+    "Region: Latin America",
+    "Region: Southeast Asia",
+    "Region: Asia",
+    "IGO Membership",
+    "Conflict Intensity",
+    "GDP per Capita (log)",
+    "ODA (log)",
+    "Natural Resources (log)"
+  ),
+  
+  # 변수 순서 정렬 (Middle East, Latin America, Southeast Asia, Asia 순)
+  order = c(
+    "Middle East", "Latin America", "Southeast Asia", "Asia",
+    "^sum_igo_full$", "^max_hostlev$", "^log_mrgdppc$", "^log_oda$", "^log_nr$"
+  ),
+  
+  # 먼들락 평균 변수와 연도 더미 숨기기
+  omit = c("^mean_", "^median_", "factor\\(year\\)"),
+  
+  add.lines = list(
+    c("Reference Region", "Africa", "Africa", "Africa", "Africa"),
+    c("Mundlak Controls", "No", "No", "Yes", "No"),
+    c("Observations", 
+      length(hyp2_model_pooled$residuals), 
+      length(hyp2_model_re$residuals), 
+      length(hyp2_model_mundlak$residuals), 
+      length(hyp2_model_between$residuals)),
+    c("R-squared", 
+      round(as.numeric(summary(hyp2_model_pooled)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp2_model_re)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp2_model_mundlak)$r.squared[1]), 3),
+      round(as.numeric(summary(hyp2_model_between)$r.squared[1]), 3))
+  ),
+  
+  omit.stat = c("f", "rsq", "adj.rsq", "n"),
+  digits = 3,
+  star.cutoffs = c(0.1, 0.05, 0.01),
+  notes = "Robust SEs (clustered by country) are reported in parentheses."
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
